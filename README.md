@@ -107,7 +107,7 @@ charset-normalizer
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-username/wind-annotation-tool.git
+git clone https://github.com/Li-H-R/wind-annotation-tool.git
 cd wind-annotation-tool
 
 # 2. 安装依赖
