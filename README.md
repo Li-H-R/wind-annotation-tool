@@ -1,4 +1,4 @@
-# -
+# wind-annotation-tool
 用于风机异常数据的标注GUI界面
 # 🌀 风机数据标注工具
 
