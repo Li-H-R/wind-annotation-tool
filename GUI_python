@@ -1,0 +1,973 @@
+"""
+风机数据标注 GUI 工具 v2.1
+新特性: 自动识别 CSV 列名（转速/风速/有功功率/桨距角），兼容不同风场命名规范
+依赖: pip install numpy pandas matplotlib
+运行: python wind_annotation_gui.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import numpy as np
+import pandas as pd
+import json
+import os
+import re
+from pathlib import Path
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import matplotlib
+matplotlib.rcParams['font.sans-serif']   = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# ─────────────────────────────────────────
+# 编码自动探测
+# ─────────────────────────────────────────
+def detect_encoding(path: str) -> str:
+    """
+    依次尝试常见编码，返回第一个能成功解码文件头的编码。
+    优先级: utf-8-sig > utf-8 > gbk > gb2312 > gb18030 > utf-16 > latin-1(兜底)
+    若安装了 chardet / charset_normalizer，优先使用其检测结果。
+    """
+    candidates = ['utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'gb18030', 'utf-16', 'latin-1']
+    try:
+        import charset_normalizer
+        with open(path, 'rb') as f:
+            raw = f.read(32768)
+        best = charset_normalizer.from_bytes(raw).best()
+        if best:
+            candidates.insert(0, str(best.encoding))
+    except ImportError:
+        try:
+            import chardet
+            with open(path, 'rb') as f:
+                raw = f.read(32768)
+            det = chardet.detect(raw)
+            if det.get('encoding'):
+                candidates.insert(0, det['encoding'])
+        except ImportError:
+            pass
+    for enc in candidates:
+        try:
+            with open(path, 'r', encoding=enc) as f:
+                f.read(4096)
+            return enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return 'latin-1'
+
+# ─────────────────────────────────────────
+# 列语义定义：每个语义槽对应一组关键词（中英文、缩写）
+# ─────────────────────────────────────────
+SEMANTIC_SLOTS = {
+    '有功功率':  {
+        'keywords': ['有功功率', '有功', '功率', 'active power', 'power', 'activepow',
+                     'gen_pow', 'genpower', 'generator power', 'kw', 'mw',
+                     'p_gen', 'pgen', 'real power'],
+        'unit_hints': ['kw', 'mw', 'w'],
+    },
+    '转速':  {
+        'keywords': ['转速', '发电机转速', '主轴转速', '叶轮转速', 'speed', 'rpm',
+                     'rotspeed', 'rot_speed', 'gen_speed', 'genspeed',
+                     'rotor speed', 'generator speed', 'shaft speed', 'r/min'],
+        'unit_hints': ['rpm', 'r/min', 'rps'],
+    },
+    '风速':  {
+        'keywords': ['风速', 'wind speed', 'windspeed', 'wind_speed', 'ws',
+                     'v_wind', 'vwind', 'anemometer', 'hub wind', 'nacelle wind',
+                     'wind vel', 'wind velocity'],
+        'unit_hints': ['m/s', 'mph', 'km/h'],
+    },
+    '风向':  {
+        'keywords': ['风向', 'wind direction', 'wind_dir', 'winddir', 'wd',
+                     'direction', 'yaw error', 'wind angle'],
+        'unit_hints': ['°', 'deg', 'degree'],
+    },
+    '桨距角1': {
+        'keywords': ['1#桨', '1号桨', '1桨', 'pitch1', 'pitch_1', 'blade1', 'blade_1',
+                     'pitch angle 1', 'pitchangle1', 'pa1', 'b1pitch', 'blade 1 pitch',
+                     '叶片1', '叶片角1', 'pitch a'],
+        'unit_hints': ['°', 'deg'],
+    },
+    '桨距角2': {
+        'keywords': ['2#桨', '2号桨', '2桨', 'pitch2', 'pitch_2', 'blade2', 'blade_2',
+                     'pitch angle 2', 'pitchangle2', 'pa2', 'b2pitch', 'blade 2 pitch',
+                     '叶片2', '叶片角2', 'pitch b'],
+        'unit_hints': ['°', 'deg'],
+    },
+    '桨距角3': {
+        'keywords': ['3#桨', '3号桨', '3桨', 'pitch3', 'pitch_3', 'blade3', 'blade_3',
+                     'pitch angle 3', 'pitchangle3', 'pa3', 'b3pitch', 'blade 3 pitch',
+                     '叶片3', '叶片角3', 'pitch c'],
+        'unit_hints': ['°', 'deg'],
+    },
+    '齿轮箱温度': {
+        'keywords': ['齿轮箱', 'gearbox', 'gear box', 'gear_box', 'gearbox temp',
+                     'gear oil temp', 'gb temp', 'gbtemp', 'gearbox oil',
+                     '齿轮箱油温', '齿轮油温'],
+        'unit_hints': ['°c', '℃', 'celsius'],
+    },
+}
+
+# 显示顺序与颜色
+SLOT_ORDER  = ['有功功率', '转速', '风速', '风向', '桨距角1', '桨距角2', '桨距角3', '齿轮箱温度']
+SLOT_COLORS = {
+    '有功功率':  '#2196F3',
+    '转速':      '#4CAF50',
+    '风速':      '#FF9800',
+    '风向':      '#E91E63',
+    '桨距角1':   '#9C27B0',
+    '桨距角2':   '#00BCD4',
+    '桨距角3':   '#FF5722',
+    '齿轮箱温度':'#795548',
+}
+
+WIND_LEVELS = {
+    '低风速':  (0, 5),
+    '中风速':  (5, 12),
+    '高风速':  (12, 99),
+}
+
+LABEL_DB_PATH = 'label_db.json'
+OUTPUT_NPY    = 'labeled_dataset.npy'
+
+PRESET_FAULT_TYPES = [
+    '正常运行', '变桨异常', '齿轮箱故障', '发电机故障',
+    '振动异常', '超速保护', '低功率异常', '温度异常', '其他故障'
+]
+
+
+# ─────────────────────────────────────────
+# 智能列名识别
+# ─────────────────────────────────────────
+def _normalize(s: str) -> str:
+    """小写 + 去除多余空白/下划线/连字符，方便模糊匹配"""
+    return re.sub(r'[\s_\-]+', ' ', s.lower()).strip()
+
+
+def auto_detect_columns(columns: list[str]) -> dict[str, str | None]:
+    """
+    返回 {slot_name: matched_column_name | None}
+    采用贪心策略：优先精确子串匹配，再考虑关键词顺序。
+    每个列只能映射到一个槽。
+    """
+    norm_cols = {col: _normalize(col) for col in columns}
+    result    = {slot: None for slot in SLOT_ORDER}
+    used_cols = set()
+
+    # 按槽顺序逐一匹配（优先处理更具体的槽以避免误匹配）
+    slot_priority = ['桨距角1', '桨距角2', '桨距角3', '有功功率', '转速',
+                     '风速', '风向', '齿轮箱温度']
+
+    for slot in slot_priority:
+        if slot not in SEMANTIC_SLOTS:
+            continue
+        keywords = [_normalize(k) for k in SEMANTIC_SLOTS[slot]['keywords']]
+        best_col  = None
+        best_score = -1
+
+        for col, norm_col in norm_cols.items():
+            if col in used_cols:
+                continue
+            for rank, kw in enumerate(keywords):
+                # 完整匹配优先，子串匹配次之
+                if norm_col == kw:
+                    score = 1000 - rank
+                elif kw in norm_col or norm_col in kw:
+                    score = 500 - rank
+                else:
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_col   = col
+
+        if best_col:
+            result[slot] = best_col
+            used_cols.add(best_col)
+
+    return result
+
+
+# ─────────────────────────────────────────
+# 数据读取（使用映射结果）
+# ─────────────────────────────────────────
+def read_raw_data(input_path: str) -> tuple[np.ndarray, dict[str, str | None], list[str]]:
+    """
+    返回:
+      data        : shape (N, num_active_slots) float32
+      col_map     : {slot: matched_col | None}
+      active_slots: 成功映射的槽列表（按 SLOT_ORDER 顺序）
+    """
+    # 先读取全部列名，不加载数据
+    try:
+        header_df = pd.read_csv(input_path, nrows=0)
+    except Exception as e:
+        raise RuntimeError(f"无法读取文件头: {e}")
+
+    all_cols = list(header_df.columns)
+    col_map  = auto_detect_columns(all_cols)
+
+    # 仅读取有效列
+    active_slots = [s for s in SLOT_ORDER if col_map.get(s) is not None]
+    if not active_slots:
+        raise RuntimeError("未能从 CSV 识别出任何有效信号列，请检查列名。")
+
+    cols_to_read = [col_map[s] for s in active_slots]
+
+    # 尝试解析时间列（忽略失败）
+    time_col = next((c for c in all_cols if _normalize(c) in ('时间', 'time', 'datetime', 'timestamp')), None)
+
+    try:
+        read_cols = cols_to_read + ([time_col] if time_col and time_col not in cols_to_read else [])
+        df = pd.read_csv(input_path, usecols=read_cols, na_values=['N/A', '', 'nan', 'NaN'])
+        if time_col and time_col in df.columns:
+            df = df.drop(columns=[time_col])
+        # 保证列序
+        df = df[cols_to_read]
+        return df.to_numpy().astype(np.float32), col_map, active_slots
+    except Exception as e:
+        raise RuntimeError(f"读取数据失败: {e}")
+
+
+def sliding_window(data: np.ndarray, W: int, S: int) -> np.ndarray:
+    N, D = data.shape
+    starts = list(range(0, N - W + 1, S))
+    if not starts:
+        return np.empty((0, W, D), dtype=np.float32)
+    return np.stack([data[i:i + W] for i in starts])
+
+
+def infer_wind_level(seg: np.ndarray, wind_slot_idx: int) -> str:
+    if wind_slot_idx < 0 or wind_slot_idx >= seg.shape[1]:
+        return '未知风速'
+    avg_wind = float(np.nanmean(seg[:, wind_slot_idx]))
+    for name, (lo, hi) in WIND_LEVELS.items():
+        if lo <= avg_wind < hi:
+            return f'{name}({lo}-{hi}m/s)'
+    return '超高风速'
+
+
+def load_label_db(path: str = LABEL_DB_PATH) -> dict:
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_label_db(db: dict, path: str = LABEL_DB_PATH):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+# ─────────────────────────────────────────
+# 列识别结果对话框
+# ─────────────────────────────────────────
+class ColumnMappingDialog(tk.Toplevel):
+    """显示自动识别结果，允许用户手动调整映射"""
+    def __init__(self, parent, col_map: dict, all_columns: list[str]):
+        super().__init__(parent)
+        self.title("📋 列名自动识别结果")
+        self.configure(bg="#1E1E2E")
+        self.resizable(False, False)
+        self.grab_set()
+        self.result = None           # None = 取消
+        self._col_map = dict(col_map)
+        self._all_cols = ['（不使用）'] + all_columns
+        self._vars: dict[str, tk.StringVar] = {}
+
+        self._build(col_map, all_columns)
+        self.wait_window()
+
+    def _build(self, col_map, all_columns):
+        tk.Label(self, text="自动识别的信号列映射", bg="#1E1E2E", fg="#7EB8F7",
+                 font=("Consolas", 11, "bold")).pack(pady=(12, 4))
+        tk.Label(self, text="请确认或手动修正。绿色=已识别，橙色=未匹配",
+                 bg="#1E1E2E", fg="#888", font=("Consolas", 8)).pack(pady=(0, 8))
+
+        grid = tk.Frame(self, bg="#252535", padx=12, pady=8)
+        grid.pack(fill=tk.BOTH, padx=16, pady=4)
+
+        headers = ["信号槽", "识别到的列名", "置信度", "手动选择"]
+        fg_h = "#7EB8F7"
+        for col_i, h in enumerate(headers):
+            tk.Label(grid, text=h, bg="#252535", fg=fg_h,
+                     font=("Consolas", 9, "bold"), padx=8).grid(row=0, column=col_i, sticky="w")
+        ttk.Separator(grid, orient=tk.HORIZONTAL).grid(row=1, column=0, columnspan=4, sticky="ew", pady=4)
+
+        for row_i, slot in enumerate(SLOT_ORDER, start=2):
+            matched = col_map.get(slot)
+            color   = "#4CAF50" if matched else "#FF9800"
+            conf    = "✅ 已匹配" if matched else "❌ 未识别"
+
+            tk.Label(grid, text=slot, bg="#252535", fg=color,
+                     font=("Consolas", 9, "bold"), padx=6).grid(row=row_i, column=0, sticky="w", pady=2)
+            tk.Label(grid, text=matched or "—", bg="#252535", fg="#DDD",
+                     font=("Consolas", 8), padx=6).grid(row=row_i, column=1, sticky="w")
+            tk.Label(grid, text=conf, bg="#252535", fg=color,
+                     font=("Consolas", 8), padx=6).grid(row=row_i, column=2, sticky="w")
+
+            var = tk.StringVar(value=matched if matched else '（不使用）')
+            self._vars[slot] = var
+            cb = ttk.Combobox(grid, textvariable=var, values=self._all_cols,
+                              width=28, state="readonly", font=("Consolas", 8))
+            cb.grid(row=row_i, column=3, padx=6, pady=2)
+
+        # 按钮
+        btn_frame = tk.Frame(self, bg="#1E1E2E")
+        btn_frame.pack(pady=12)
+        tk.Button(btn_frame, text="✅ 确认并加载", command=self._confirm,
+                  bg="#4CAF50", fg="white", relief=tk.FLAT, font=("Consolas", 10, "bold"),
+                  padx=16, pady=6, cursor="hand2").pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_frame, text="❌ 取消", command=self.destroy,
+                  bg="#F44336", fg="white", relief=tk.FLAT, font=("Consolas", 10, "bold"),
+                  padx=16, pady=6, cursor="hand2").pack(side=tk.LEFT, padx=8)
+
+    def _confirm(self):
+        final = {}
+        for slot, var in self._vars.items():
+            v = var.get()
+            final[slot] = None if v == '（不使用）' else v
+        self.result = final
+        self.destroy()
+
+
+# ─────────────────────────────────────────
+# 主 GUI
+# ─────────────────────────────────────────
+class AnnotationApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("🌀 风机数据标注工具 v2.1  [智能列识别]")
+        self.geometry("1440x880")
+        self.minsize(1100, 700)
+        self.configure(bg="#1E1E2E")
+
+        # 状态
+        self.windows:       np.ndarray  = np.empty((0,))
+        self.cur_idx:       int         = 0
+        self.label_db:      dict        = load_label_db()
+        self.annotation_map: dict[int, str] = {}
+        self.skip_set:      set         = set()
+        self.active_slots:  list[str]   = []   # 当前有效信号槽列表
+        self.wind_slot_idx: int         = -1   # 风速在 active_slots 中的下标
+        self.col_map:       dict        = {}   # slot -> original col name
+
+        # UI 参数
+        self.W_var        = tk.IntVar(value=10)
+        self.S_var        = tk.IntVar(value=1)
+        self.auto_advance = tk.BooleanVar(value=True)
+        self.show_stats   = tk.BooleanVar(value=True)
+
+        self._build_ui()
+        self._bind_keys()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── UI 构建 ──────────────────────────
+    def _build_ui(self):
+        toolbar = tk.Frame(self, bg="#13131F", pady=4)
+        toolbar.pack(fill=tk.X, side=tk.TOP)
+        self._build_toolbar(toolbar)
+
+        body = tk.Frame(self, bg="#1E1E2E")
+        body.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        left = tk.Frame(body, bg="#252535", width=230, relief=tk.FLAT, bd=0)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        left.pack_propagate(False)
+        self._build_left_panel(left)
+
+        center = tk.Frame(body, bg="#1E1E2E")
+        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._build_chart(center)
+
+        right = tk.Frame(body, bg="#252535", width=290, relief=tk.FLAT, bd=0)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        right.pack_propagate(False)
+        self._build_right_panel(right)
+
+        self._build_statusbar()
+
+    def _build_toolbar(self, parent):
+        btn_style = dict(bg="#2D2D3F", fg="white", relief=tk.FLAT,
+                         font=("Consolas", 9, "bold"), padx=10, pady=4,
+                         cursor="hand2", activebackground="#3D3D5F", activeforeground="white")
+
+        tk.Button(parent, text="📂 加载 CSV", command=self._load_csv, **btn_style).pack(side=tk.LEFT, padx=4)
+        tk.Button(parent, text="📁 批量加载", command=self._load_multi_csv, **btn_style).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(parent, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=4)
+
+        tk.Label(parent, text="窗长W:", bg="#13131F", fg="#AAA", font=("Consolas", 9)).pack(side=tk.LEFT)
+        tk.Spinbox(parent, from_=5, to=500, textvariable=self.W_var, width=5,
+                   bg="#2D2D3F", fg="white", buttonbackground="#3D3D5F",
+                   relief=tk.FLAT, font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(parent, text="步长S:", bg="#13131F", fg="#AAA", font=("Consolas", 9)).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Spinbox(parent, from_=1, to=200, textvariable=self.S_var, width=5,
+                   bg="#2D2D3F", fg="white", buttonbackground="#3D3D5F",
+                   relief=tk.FLAT, font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+
+        tk.Button(parent, text="⚙ 应用分窗", command=self._apply_window, **btn_style).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(parent, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=4)
+
+        tk.Button(parent, text="💾 保存结果", command=self._save_results, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(parent, text="📊 查看统计", command=self._show_summary, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(parent, text="🔄 重置标注", command=self._reset_annotations, **btn_style).pack(side=tk.LEFT, padx=2)
+
+        tk.Checkbutton(parent, text="标注后自动跳转", variable=self.auto_advance,
+                       bg="#13131F", fg="#AAA", selectcolor="#2D2D3F",
+                       activebackground="#13131F", font=("Consolas", 8)).pack(side=tk.RIGHT, padx=8)
+
+    def _build_left_panel(self, parent):
+        # 进度
+        prog_frame = tk.LabelFrame(parent, text=" 进度 ", bg="#252535", fg="#7EB8F7",
+                                    font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        prog_frame.pack(fill=tk.X, padx=8, pady=(10, 4))
+        self.progress_bar   = ttk.Progressbar(prog_frame, mode='determinate', length=190)
+        self.progress_bar.pack(padx=8, pady=4)
+        self.progress_label = tk.Label(prog_frame, text="0 / 0", bg="#252535", fg="white",
+                                        font=("Consolas", 10, "bold"))
+        self.progress_label.pack()
+        self.annotated_label = tk.Label(prog_frame, text="已标注: 0  跳过: 0",
+                                         bg="#252535", fg="#AAA", font=("Consolas", 8))
+        self.annotated_label.pack(pady=(0, 4))
+
+        # 导航
+        nav_frame = tk.LabelFrame(parent, text=" 导航 ", bg="#252535", fg="#7EB8F7",
+                                   font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        nav_frame.pack(fill=tk.X, padx=8, pady=4)
+        nav_btn = dict(bg="#2D5F8A", fg="white", relief=tk.FLAT, font=("Consolas", 9, "bold"),
+                       width=9, cursor="hand2", activebackground="#3D7FAA")
+        tk.Button(nav_frame, text="◀◀ 第一个", command=lambda: self._goto(0), **nav_btn).pack(pady=2, padx=6)
+        tk.Button(nav_frame, text="◀ 上一个",  command=self._prev, **nav_btn).pack(pady=2, padx=6)
+        tk.Button(nav_frame, text="▶ 下一个",  command=self._next, **nav_btn).pack(pady=2, padx=6)
+        tk.Button(nav_frame, text="▶▶ 最后个", command=lambda: self._goto(len(self.windows)-1), **nav_btn).pack(pady=2, padx=6)
+
+        jump_frame = tk.Frame(nav_frame, bg="#252535")
+        jump_frame.pack(pady=4)
+        tk.Label(jump_frame, text="跳至:", bg="#252535", fg="#AAA", font=("Consolas", 8)).pack(side=tk.LEFT)
+        self.jump_entry = tk.Entry(jump_frame, width=7, bg="#1A1A2E", fg="white",
+                                    insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
+        self.jump_entry.pack(side=tk.LEFT, padx=4)
+        tk.Button(jump_frame, text="GO", command=self._jump_to,
+                  bg="#4CAF50", fg="white", relief=tk.FLAT, font=("Consolas", 8, "bold"),
+                  cursor="hand2", padx=4).pack(side=tk.LEFT)
+
+        # 已标注列表
+        list_frame = tk.LabelFrame(parent, text=" 已标注列表 ", bg="#252535", fg="#7EB8F7",
+                                    font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self.annotated_list = tk.Listbox(list_frame, bg="#1A1A2E", fg="#DDD",
+                                          selectbackground="#2D5F8A", relief=tk.FLAT,
+                                          font=("Consolas", 8), activestyle='none')
+        scrollbar = ttk.Scrollbar(list_frame, command=self.annotated_list.yview)
+        self.annotated_list.config(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.annotated_list.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.annotated_list.bind("<<ListboxSelect>>", self._on_list_select)
+
+        # 列识别状态面板
+        map_frame = tk.LabelFrame(parent, text=" 列识别状态 ", bg="#252535", fg="#7EB8F7",
+                                   font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        map_frame.pack(fill=tk.X, padx=8, pady=(4, 8))
+        self.col_map_label = tk.Label(map_frame, text="尚未加载数据", bg="#252535",
+                                       fg="#888", font=("Consolas", 7), justify=tk.LEFT)
+        self.col_map_label.pack(anchor=tk.W, padx=6, pady=4)
+
+    def _build_chart(self, parent):
+        info_bar = tk.Frame(parent, bg="#1A1A2E", pady=3)
+        info_bar.pack(fill=tk.X)
+        self.seg_info_label = tk.Label(info_bar, text="请加载数据文件", bg="#1A1A2E",
+                                        fg="#7EB8F7", font=("Consolas", 10, "bold"))
+        self.seg_info_label.pack(side=tk.LEFT, padx=10)
+        self.wind_badge = tk.Label(info_bar, text="", bg="#2D5F8A", fg="white",
+                                    font=("Consolas", 9, "bold"), padx=8, pady=2)
+        self.wind_badge.pack(side=tk.LEFT, padx=6)
+        self.cur_label_badge = tk.Label(info_bar, text="", bg="#1A1A2E", fg="#4CAF50",
+                                         font=("Consolas", 9, "bold"), padx=8)
+        self.cur_label_badge.pack(side=tk.LEFT)
+
+        self.fig = Figure(figsize=(9, 6.5), dpi=92, facecolor="#1E1E2E")
+        self.fig.subplots_adjust(hspace=0.12, left=0.08, right=0.97, top=0.97, bottom=0.05)
+
+        chart_frame = tk.Frame(parent, bg="#1E1E2E")
+        chart_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        toolbar_frame = tk.Frame(chart_frame, bg="#1A1A2E")
+        toolbar_frame.pack(fill=tk.X)
+        self.nav_toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.nav_toolbar.config(background="#1A1A2E")
+        self.nav_toolbar.update()
+
+        self.stats_frame = tk.Frame(parent, bg="#1A1A2E")
+        self.stats_frame.pack(fill=tk.X, padx=4, pady=2)
+        self.stats_label = tk.Label(self.stats_frame, text="", bg="#1A1A2E", fg="#AAA",
+                                     font=("Consolas", 8), justify=tk.LEFT, wraplength=820)
+        self.stats_label.pack(padx=6, pady=2)
+
+    def _build_right_panel(self, parent):
+        tk.Label(parent, text="📌 标注面板", bg="#252535", fg="#7EB8F7",
+                  font=("Consolas", 11, "bold")).pack(pady=(10, 4))
+
+        wl_frame = tk.LabelFrame(parent, text=" 风速等级 ", bg="#252535", fg="#7EB8F7",
+                                  font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        wl_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.wind_level_var = tk.StringVar()
+        for wl in ['低风速(0-5m/s)', '中风速(5-12m/s)', '高风速(12-99m/s)', '超高风速']:
+            tk.Radiobutton(wl_frame, text=wl, variable=self.wind_level_var, value=wl,
+                           bg="#252535", fg="#CCC", selectcolor="#1A1A2E",
+                           activebackground="#252535", font=("Consolas", 8)).pack(anchor=tk.W, padx=8)
+
+        ft_frame = tk.LabelFrame(parent, text=" 故障/状态类型 ", bg="#252535", fg="#7EB8F7",
+                                  font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        ft_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.fault_type_var = tk.StringVar()
+        for ft in PRESET_FAULT_TYPES:
+            tk.Radiobutton(ft_frame, text=ft, variable=self.fault_type_var, value=ft,
+                           bg="#252535", fg="#CCC", selectcolor="#1A1A2E",
+                           activebackground="#252535", font=("Consolas", 8)).pack(anchor=tk.W, padx=8)
+
+        custom_frame = tk.LabelFrame(parent, text=" 自定义标签 ", bg="#252535", fg="#7EB8F7",
+                                      font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        custom_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.custom_label_entry = tk.Entry(custom_frame, bg="#1A1A2E", fg="white",
+                                            insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
+        self.custom_label_entry.pack(fill=tk.X, padx=6, pady=4)
+        tk.Label(custom_frame, text="(留空则自动组合风速+故障类型)",
+                 bg="#252535", fg="#888", font=("Consolas", 7)).pack(padx=6)
+
+        remark_frame = tk.LabelFrame(parent, text=" 备注 ", bg="#252535", fg="#7EB8F7",
+                                      font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        remark_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.remark_entry = tk.Entry(remark_frame, bg="#1A1A2E", fg="white",
+                                      insertbackground="white", relief=tk.FLAT, font=("Consolas", 9))
+        self.remark_entry.pack(fill=tk.X, padx=6, pady=4)
+
+        btn_frame = tk.Frame(parent, bg="#252535")
+        btn_frame.pack(fill=tk.X, padx=8, pady=6)
+        tk.Button(btn_frame, text="✅ 确认标注", command=self._confirm_label,
+                  bg="#4CAF50", fg="white", relief=tk.FLAT, font=("Consolas", 10, "bold"),
+                  pady=6, cursor="hand2", activebackground="#66BB6A").pack(fill=tk.X, pady=2)
+        tk.Button(btn_frame, text="⏭ 跳过 (S)", command=self._skip,
+                  bg="#FF9800", fg="white", relief=tk.FLAT, font=("Consolas", 10, "bold"),
+                  pady=6, cursor="hand2", activebackground="#FFA726").pack(fill=tk.X, pady=2)
+        tk.Button(btn_frame, text="🗑 删除标注", command=self._delete_label,
+                  bg="#F44336", fg="white", relief=tk.FLAT, font=("Consolas", 9, "bold"),
+                  pady=4, cursor="hand2", activebackground="#EF5350").pack(fill=tk.X, pady=2)
+
+        hist_frame = tk.LabelFrame(parent, text=" 历史标签 (双击应用) ", bg="#252535", fg="#7EB8F7",
+                                    font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        hist_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        self.history_list = tk.Listbox(hist_frame, bg="#1A1A2E", fg="#DDD",
+                                        selectbackground="#2D5F8A", relief=tk.FLAT,
+                                        font=("Consolas", 8), activestyle='none')
+        hs = ttk.Scrollbar(hist_frame, command=self.history_list.yview)
+        self.history_list.config(yscrollcommand=hs.set)
+        hs.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_list.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.history_list.bind("<Double-1>", self._apply_history_label)
+
+        keys_frame = tk.LabelFrame(parent, text=" 快捷键 ", bg="#252535", fg="#7EB8F7",
+                                    font=("Consolas", 9, "bold"), bd=1, relief=tk.GROOVE)
+        keys_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        for key, desc in [("← →", "上/下片段"), ("Enter", "确认标注"), ("S", "跳过"), ("Del", "删除标注")]:
+            tk.Label(keys_frame, text=f"  {key:6s} {desc}", bg="#252535", fg="#AAA",
+                      font=("Consolas", 7)).pack(anchor=tk.W)
+
+    def _build_statusbar(self):
+        self.statusbar = tk.Label(self, text="就绪 | 请加载 CSV 数据文件", bg="#13131F",
+                                   fg="#888", font=("Consolas", 8), anchor=tk.W, padx=10)
+        self.statusbar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _bind_keys(self):
+        self.bind("<Left>",   lambda e: self._prev())
+        self.bind("<Right>",  lambda e: self._next())
+        self.bind("<Return>", lambda e: self._confirm_label())
+        self.bind("<s>",      lambda e: self._skip())
+        self.bind("<S>",      lambda e: self._skip())
+        self.bind("<Delete>", lambda e: self._delete_label())
+
+    # ── 更新列识别状态标签 ───────────────
+    def _update_col_map_display(self):
+        if not self.col_map:
+            self.col_map_label.config(text="尚未加载数据")
+            return
+        lines = []
+        for slot in SLOT_ORDER:
+            matched = self.col_map.get(slot)
+            if matched:
+                short = matched[:22] + ".." if len(matched) > 24 else matched
+                lines.append(f"✅ {slot}: {short}")
+            else:
+                lines.append(f"❌ {slot}: 未识别")
+        self.col_map_label.config(text="\n".join(lines))
+
+    # ── 数据加载 ─────────────────────────
+    def _load_csv(self):
+        path = filedialog.askopenfilename(
+            title="选择 CSV 数据文件",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
+        self._load_single_path(path)
+
+    def _load_single_path(self, path: str):
+        try:
+            enc = detect_encoding(path)
+            # 先读取列名，供识别确认对话框使用
+            header_df  = pd.read_csv(path, nrows=0, encoding=enc)
+            all_cols   = list(header_df.columns)
+            auto_map   = auto_detect_columns(all_cols)
+
+            # 弹出确认对话框
+            dlg = ColumnMappingDialog(self, auto_map, all_cols)
+            if dlg.result is None:
+                return   # 用户取消
+            confirmed_map = dlg.result
+
+            # 用确认后的映射重新读取数据
+            active_slots = [s for s in SLOT_ORDER if confirmed_map.get(s)]
+            if not active_slots:
+                messagebox.showerror("错误", "至少需要映射一个信号列")
+                return
+
+            cols_to_read = [confirmed_map[s] for s in active_slots]
+            df = pd.read_csv(path, usecols=cols_to_read, encoding=enc,
+                             na_values=['N/A', '', 'nan', 'NaN'])
+            df = df[cols_to_read]
+            raw = df.to_numpy().astype(np.float32)
+
+            self.col_map     = confirmed_map
+            self.active_slots = active_slots
+            self.wind_slot_idx = active_slots.index('风速') if '风速' in active_slots else -1
+
+            self._init_windows(raw)
+            self._update_col_map_display()
+            self._set_status(f"已加载: {Path(path).name}  共 {len(raw)} 行  识别 {len(active_slots)} 个信号")
+        except Exception as e:
+            messagebox.showerror("加载失败", str(e))
+
+    def _load_multi_csv(self):
+        paths = filedialog.askopenfilenames(
+            title="批量选择 CSV 文件",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not paths:
+            return
+        # 对第一个文件显示确认对话框，后续文件复用同一映射
+        try:
+            enc0 = detect_encoding(paths[0])
+            header_df = pd.read_csv(paths[0], nrows=0, encoding=enc0)
+            all_cols  = list(header_df.columns)
+            auto_map  = auto_detect_columns(all_cols)
+            dlg = ColumnMappingDialog(self, auto_map, all_cols)
+            if dlg.result is None:
+                return
+            confirmed_map = dlg.result
+        except Exception as e:
+            messagebox.showerror("读取失败", str(e))
+            return
+
+        active_slots = [s for s in SLOT_ORDER if confirmed_map.get(s)]
+        if not active_slots:
+            messagebox.showerror("错误", "至少需要映射一个信号列")
+            return
+        cols_to_read = [confirmed_map[s] for s in active_slots]
+
+        data_list = []
+        for p in paths:
+            try:
+                enc = detect_encoding(p)
+                df = pd.read_csv(p, usecols=cols_to_read, encoding=enc,
+                                 na_values=['N/A', '', 'nan', 'NaN'])
+                df = df[cols_to_read]
+                data_list.append(df.to_numpy().astype(np.float32))
+            except Exception as e:
+                messagebox.showwarning("跳过", f"{Path(p).name}: {e}")
+
+        if data_list:
+            raw = np.vstack(data_list)
+            self.col_map      = confirmed_map
+            self.active_slots = active_slots
+            self.wind_slot_idx = active_slots.index('风速') if '风速' in active_slots else -1
+            self._init_windows(raw)
+            self._update_col_map_display()
+            self._set_status(f"已加载 {len(paths)} 个文件，共 {len(raw)} 行，识别 {len(active_slots)} 个信号")
+
+    def _init_windows(self, raw: np.ndarray):
+        W, S = self.W_var.get(), self.S_var.get()
+        self.windows = sliding_window(raw, W, S)
+        self.cur_idx = 0
+        self.annotation_map = {}
+        self.skip_set = set()
+        self._label_index_map: dict[int, str] = {}
+        self._refresh_history_list()
+        self._goto(0)
+        self._set_status(f"分窗完成: {len(self.windows)} 段  窗长={W} 步长={S}")
+
+    def _apply_window(self):
+        messagebox.showinfo("提示", "请重新加载文件以应用新的分窗参数。")
+
+    # ── 图表渲染 ─────────────────────────
+    def _refresh_chart(self):
+        if len(self.windows) == 0 or not self.active_slots:
+            return
+        seg    = self.windows[self.cur_idx]
+        n_dims = seg.shape[1]
+
+        self.fig.clear()
+        n_plots = n_dims
+        if n_plots == 0:
+            self.canvas.draw()
+            return
+
+        axes = self.fig.subplots(n_plots, 1, sharex=True)
+        if n_plots == 1:
+            axes = [axes]
+
+        time_axis = np.arange(seg.shape[0])
+        for plot_i in range(n_dims):
+            slot = self.active_slots[plot_i]
+            color = SLOT_COLORS.get(slot, '#AAAAAA')
+            ax = axes[plot_i]
+            ax.set_facecolor("#1A1A2E")
+            ax.tick_params(colors="#888", labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_color("#333355")
+
+            y = seg[:, plot_i]
+            ax.plot(time_axis, y, color=color, linewidth=1.0)
+            ax.fill_between(time_axis, y, alpha=0.12, color=color)
+
+            # 显示槽名 + 原始列名
+            orig_col = self.col_map.get(slot, slot)
+            label_text = f"{slot}" if slot == orig_col else f"{slot}\n({orig_col[:10]})"
+            ax.set_ylabel(label_text, color="#AAA", fontsize=6)
+            ax.grid(True, alpha=0.15, color="#444466")
+
+            if self.show_stats.get():
+                mn, mx, av = np.nanmin(y), np.nanmax(y), np.nanmean(y)
+                ax.axhline(av, color="#FFD700", linewidth=0.6, linestyle="--", alpha=0.6)
+                ax.text(0.99, 0.92, f"avg={av:.2f}  min={mn:.2f}  max={mx:.2f}",
+                        transform=ax.transAxes, fontsize=6, color="#AAA", ha="right", va="top")
+
+        axes[-1].set_xlabel("时间步", color="#AAA", fontsize=8)
+        self.fig.patch.set_facecolor("#1E1E2E")
+        self.canvas.draw()
+
+        # 信息栏
+        wind_level = infer_wind_level(seg, self.wind_slot_idx)
+        avg_vals   = np.nanmean(seg, axis=0)
+        self.seg_info_label.config(text=f"片段 {self.cur_idx + 1} / {len(self.windows)}")
+        self.wind_badge.config(text=wind_level)
+        self.wind_level_var.set(wind_level)
+
+        stats_parts = [f"{self.active_slots[i][:4]}={avg_vals[i]:.2f}" for i in range(n_dims)]
+        self.stats_label.config(text="  |  ".join(stats_parts))
+
+        existing = self.annotation_map.get(self.cur_idx, "")
+        self.cur_label_badge.config(
+            text=f"✅ {existing}" if existing else ("⏭ 已跳过" if self.cur_idx in self.skip_set else ""),
+            fg="#4CAF50" if existing else "#FF9800"
+        )
+
+    def _update_progress(self):
+        n = len(self.windows)
+        if n == 0:
+            return
+        annotated = len(self.annotation_map)
+        skipped   = len(self.skip_set)
+        self.progress_bar["maximum"] = n
+        self.progress_bar["value"]   = annotated + skipped
+        self.progress_label.config(text=f"{self.cur_idx + 1} / {n}")
+        self.annotated_label.config(text=f"已标注: {annotated}  跳过: {skipped}")
+
+    def _update_annotated_list(self):
+        self.annotated_list.delete(0, tk.END)
+        for idx in sorted(self.annotation_map.keys()):
+            lbl   = self.annotation_map[idx]
+            short = lbl[:28] + ".." if len(lbl) > 30 else lbl
+            self.annotated_list.insert(tk.END, f"[{idx+1:4d}] {short}")
+
+    def _refresh_history_list(self):
+        self.history_list.delete(0, tk.END)
+        for k, v in sorted(self.label_db.items(), key=lambda x: -x[1].get('count', 0)):
+            cnt = v.get('count', 0)
+            self.history_list.insert(tk.END, f"({cnt:3d}) {k}")
+
+    # ── 导航 ────────────────────────────
+    def _goto(self, idx: int):
+        if len(self.windows) == 0:
+            return
+        self.cur_idx = max(0, min(idx, len(self.windows) - 1))
+        self._refresh_chart()
+        self._update_progress()
+
+    def _next(self):  self._goto(self.cur_idx + 1)
+    def _prev(self):  self._goto(self.cur_idx - 1)
+
+    def _jump_to(self):
+        try:
+            idx = int(self.jump_entry.get()) - 1
+            self._goto(idx)
+        except ValueError:
+            messagebox.showwarning("输入错误", "请输入有效的片段序号")
+
+    def _on_list_select(self, event):
+        sel = self.annotated_list.curselection()
+        if not sel:
+            return
+        text = self.annotated_list.get(sel[0])
+        try:
+            idx = int(text[1:5].strip()) - 1
+            self._goto(idx)
+        except Exception:
+            pass
+
+    # ── 标注操作 ────────────────────────
+    def _get_label_from_ui(self) -> str:
+        custom = self.custom_label_entry.get().strip()
+        if custom:
+            return custom
+        wl = self.wind_level_var.get() or infer_wind_level(self.windows[self.cur_idx], self.wind_slot_idx)
+        ft = self.fault_type_var.get() or "未知"
+        return f"{wl}_{ft}"
+
+    def _confirm_label(self):
+        if len(self.windows) == 0:
+            return
+        label  = self._get_label_from_ui()
+        remark = self.remark_entry.get().strip()
+        if not label:
+            messagebox.showwarning("提示", "请选择或输入标签")
+            return
+
+        self.annotation_map[self.cur_idx] = label
+        self.skip_set.discard(self.cur_idx)
+        if not hasattr(self, '_label_index_map'):
+            self._label_index_map = {}
+        self._label_index_map[self.cur_idx] = label
+
+        if label not in self.label_db:
+            self.label_db[label] = {'count': 0, 'remark': remark}
+        self.label_db[label]['count'] = self.label_db[label].get('count', 0) + 1
+        if remark:
+            self.label_db[label]['remark'] = remark
+        save_label_db(self.label_db)
+
+        self._update_annotated_list()
+        self._update_progress()
+        self._refresh_history_list()
+        self._set_status(f"片段 {self.cur_idx + 1} → 标注: {label}")
+
+        self.custom_label_entry.delete(0, tk.END)
+        self.remark_entry.delete(0, tk.END)
+
+        if self.auto_advance.get():
+            self._next()
+        else:
+            self._refresh_chart()
+
+    def _skip(self):
+        if len(self.windows) == 0:
+            return
+        self.skip_set.add(self.cur_idx)
+        self._set_status(f"片段 {self.cur_idx + 1} → 跳过")
+        self._update_progress()
+        if self.auto_advance.get():
+            self._next()
+        else:
+            self._refresh_chart()
+
+    def _delete_label(self):
+        if self.cur_idx in self.annotation_map:
+            label = self.annotation_map.pop(self.cur_idx)
+            if hasattr(self, '_label_index_map'):
+                self._label_index_map.pop(self.cur_idx, None)
+            self._set_status(f"片段 {self.cur_idx + 1} 标注已删除 (原: {label})")
+            self._update_annotated_list()
+            self._update_progress()
+            self._refresh_chart()
+
+    def _apply_history_label(self, event):
+        sel = self.history_list.curselection()
+        if not sel:
+            return
+        text  = self.history_list.get(sel[0])
+        label = text[6:].strip()
+        parts = label.split("_", 1)
+        if len(parts) == 2:
+            self.wind_level_var.set(parts[0])
+            self.fault_type_var.set(parts[1] if parts[1] in PRESET_FAULT_TYPES else "")
+            self.custom_label_entry.delete(0, tk.END)
+        else:
+            self.custom_label_entry.delete(0, tk.END)
+            self.custom_label_entry.insert(0, label)
+
+    # ── 保存 & 统计 ─────────────────────
+    def _save_results(self):
+        if not self.annotation_map:
+            messagebox.showinfo("提示", "尚无标注数据")
+            return
+        labeled: dict[str, list] = {}
+        for idx, label in self.annotation_map.items():
+            labeled.setdefault(label, []).append(self.windows[idx])
+        result = {k: np.stack(v) for k, v in labeled.items()}
+
+        path = filedialog.asksaveasfilename(
+            title="保存标注结果", defaultextension=".npy",
+            filetypes=[("NumPy 文件", "*.npy"), ("所有文件", "*.*")],
+            initialfile=OUTPUT_NPY)
+        if path:
+            np.save(path, result)
+            save_label_db(self.label_db)
+            summary = "\n".join(f"  {k}: {v.shape}" for k, v in result.items())
+            messagebox.showinfo("保存成功", f"已保存到:\n{path}\n\n标注摘要:\n{summary}")
+            self._set_status(f"结果已保存: {Path(path).name}")
+
+    def _show_summary(self):
+        if not self.annotation_map:
+            messagebox.showinfo("统计", "尚无标注数据")
+            return
+        from collections import Counter
+        counter = Counter(self.annotation_map.values())
+        lines = [f"总片段数: {len(self.windows)}", f"已标注: {len(self.annotation_map)}",
+                 f"跳过: {len(self.skip_set)}", "",
+                 f"识别信号 ({len(self.active_slots)}个):"]
+        for slot in self.active_slots:
+            lines.append(f"  {slot} ← {self.col_map.get(slot, '?')}")
+        lines += ["", "各类标签分布:"]
+        for label, cnt in counter.most_common():
+            lines.append(f"  [{cnt:4d}] {label}")
+        messagebox.showinfo("标注统计", "\n".join(lines))
+
+    def _reset_annotations(self):
+        if messagebox.askyesno("确认", "确定要清空所有标注？此操作不可撤销。"):
+            self.annotation_map   = {}
+            self.skip_set         = set()
+            self._label_index_map = {}
+            self._update_annotated_list()
+            self._update_progress()
+            self._refresh_chart()
+            self._set_status("标注已全部清除")
+
+    # ── 工具 ────────────────────────────
+    def _set_status(self, msg: str):
+        self.statusbar.config(text=f"  {msg}")
+
+    def _on_close(self):
+        if self.annotation_map:
+            if messagebox.askyesno("退出确认", "标注数据尚未保存，是否退出？"):
+                self.destroy()
+        else:
+            self.destroy()
+
+
+# ─────────────────────────────────────────
+# 入口
+# ─────────────────────────────────────────
+if __name__ == "__main__":
+    app = AnnotationApp()
+    app.mainloop()
